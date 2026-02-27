@@ -1,0 +1,599 @@
+name: 🍕 Release to dev environment. 🍕
+
+on:
+  pull_request:
+    branches:
+      - dev
+    types:
+      - opened
+      - synchronize
+      - reopened
+  pull_request_target:
+    branches:
+      - dev
+    types:
+      - closed
+
+env:
+  KUBECORE_REGISTRY: ${{ vars.KUBECORE_REGISTRY }}
+  KUBECORE_REGISTRY_UNAME: ${{ secrets.KUBECORE_REGISTRY_UNAME }}
+  KUBECORE_REGISTRY_PWD: ${{ secrets.KUBECORE_REGISTRY_PWD }}
+  KUBECORE_KUBEPROJECT_REPO: ${{ vars.KUBECORE_KUBEPROJECT_REPO }}
+  APP_NAME: ${{ github.event.repository.name }}
+  SHORT_SHA: ${{ github.sha }}
+
+jobs:
+
+  # SINGLE GATE JOB - determines if we should proceed at all
+  gate-check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_process: ${{ steps.check.outputs.should_process }}
+      branch_type: ${{ steps.check.outputs.branch_type }}
+      is_merge_back: ${{ steps.check.outputs.is_merge_back }}
+    steps:
+      - name: Check if workflow should proceed
+        id: check
+        run: |
+          SOURCE_BRANCH="${{ github.head_ref || github.event.pull_request.head.ref }}"
+          echo "Source branch: $SOURCE_BRANCH"
+          echo "Event: ${{ github.event_name }}"
+          
+          # Check if this is a merge-back from main or rc
+          if [[ "$SOURCE_BRANCH" == "main" || "$SOURCE_BRANCH" =~ ^rc/ ]]; then
+            echo "should_process=false" >> $GITHUB_OUTPUT
+            echo "is_merge_back=true" >> $GITHUB_OUTPUT
+            echo "branch_type=merge-back" >> $GITHUB_OUTPUT
+            echo "⏭️ SKIPPING: Detected merge-back from $SOURCE_BRANCH to dev"
+            
+            # Short-circuit with a clear message
+            echo "::notice title=Workflow Skipped::Merge-back detected from $SOURCE_BRANCH - workflow will not process this PR"
+            exit 0
+          fi
+          
+          # Determine branch type for regular branches
+          if [[ "$SOURCE_BRANCH" =~ ^feature/.+ ]]; then
+            echo "branch_type=feature" >> $GITHUB_OUTPUT
+          elif [[ "$SOURCE_BRANCH" =~ ^bug/.+ ]] || [[ "$SOURCE_BRANCH" =~ ^bugfix/.+ ]]; then
+            echo "branch_type=bug" >> $GITHUB_OUTPUT
+          elif [[ "$SOURCE_BRANCH" =~ ^breaking/.+ ]]; then
+            echo "branch_type=breaking" >> $GITHUB_OUTPUT
+          elif [[ "$SOURCE_BRANCH" =~ ^maintenance/.+ ]]; then
+            echo "branch_type=maintenance" >> $GITHUB_OUTPUT
+          elif [[ "$SOURCE_BRANCH" =~ ^chore/.+ ]]; then
+            echo "branch_type=chore" >> $GITHUB_OUTPUT
+          else
+            echo "branch_type=other" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "should_process=true" >> $GITHUB_OUTPUT
+          echo "is_merge_back=false" >> $GITHUB_OUTPUT
+          echo "✅ PROCEEDING: Regular branch $SOURCE_BRANCH"
+
+  # This job runs when a PR is opened/updated but not yet merged
+  # All other jobs depend on the gate and only run if should_process=true
+  validate-pr:
+    needs: gate-check
+    if: needs.gate-check.outputs.should_process == 'true' && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Validate branch naming
+        run: |
+          PR_BRANCH="${{ github.event.pull_request.head.ref }}"
+          BRANCH_TYPE="${{ needs.gate-check.outputs.branch_type }}"
+          
+          if [[ "$BRANCH_TYPE" != "other" ]]; then
+            echo "✅ Branch naming follows convention: $PR_BRANCH"
+          else
+            echo "❌ Branch naming doesn't follow convention: $PR_BRANCH"
+            echo "Expected format: feature/*, bugfix/*, bug/*, breaking/*, maintenance/*, chore/*"
+            exit 1
+          fi
+          
+      - name: Comment on PR with branch info
+        if: needs.gate-check.outputs.branch_type != 'chore'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const branchType = '${{ needs.gate-check.outputs.branch_type }}';
+            let versionBump = 'none';
+            
+            if (branchType === 'feature') {
+              versionBump = 'minor';
+            } else if (branchType === 'breaking') {
+              versionBump = 'major';
+            } else if (['bug', 'bugfix', 'maintenance'].includes(branchType)) {
+              versionBump = 'patch';
+            }
+            
+            if (versionBump !== 'none') {
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `## Branch Analysis
+                
+                - **Branch type**: \`${branchType}\`
+                - **Version impact**: This PR will trigger a \`${versionBump}\` version bump when merged
+                
+                Upon merge to dev, a new dev build will be created automatically.
+                
+                ### Release Candidate
+                If you would like to create a release candidate branch automatically when this PR is merged, please add the \`create-rc🚀\` label to this PR.`
+              });
+            }
+  # This job runs when a PR is merged to dev
+  handle-merged-pr:
+    needs: gate-check
+    if: needs.gate-check.outputs.should_process == 'true' && github.event_name == 'pull_request_target' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      issues: read
+    outputs:
+      new_version: ${{ steps.calculate-version.outputs.new_version }}
+      image_tag: ${{ steps.set-image-tag.outputs.image_tag }}
+      full_image_name: ${{ steps.set-image-tag.outputs.full_image_name }}
+      branch_type: ${{ steps.set-branch-type.outputs.branch_type }}
+      create_rc_branch: ${{ steps.check-labels.outputs.create_rc }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: '0'
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Set branch type
+        id: set-branch-type
+        run: |
+          PR_BRANCH="${{ github.event.pull_request.head.ref }}"
+          if [[ "$PR_BRANCH" =~ ^feature/.+ ]]; then
+            echo "branch_type=feature" >> $GITHUB_OUTPUT
+          elif [[ "$PR_BRANCH" =~ ^bug/.+ ]]; then
+            echo "branch_type=bug" >> $GITHUB_OUTPUT
+          elif [[ "$PR_BRANCH" =~ ^bugfix/.+ ]]; then
+            echo "branch_type=bugfix" >> $GITHUB_OUTPUT
+          elif [[ "$PR_BRANCH" =~ ^breaking/.+ ]]; then
+            echo "branch_type=breaking" >> $GITHUB_OUTPUT
+          elif [[ "$PR_BRANCH" =~ ^maintenance/.+ ]]; then
+            echo "branch_type=maintenance" >> $GITHUB_OUTPUT
+          elif [[ "$PR_BRANCH" =~ ^chore/.+ ]]; then
+            echo "branch_type=chore" >> $GITHUB_OUTPUT
+          elif [[ "$PR_BRANCH" =~ ^rc/.+ ]]; then
+            echo "branch_type=rc" >> $GITHUB_OUTPUT
+          else
+            echo "branch_type=other" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check PR labels
+        id: check-labels
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            try {
+              const { data: labels } = await github.rest.issues.listLabelsOnIssue({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number
+              });
+              
+              // Check if 'create-rc🚀' label exists
+              const createRc = labels.some(label => label.name === 'create-rc🚀');
+              core.setOutput('create_rc', createRc ? 'true' : 'false');
+              console.log(`Create RC branch: ${createRc}`);
+            } catch (error) {
+              console.error('Error checking labels:', error);
+              core.setOutput('create_rc', 'false');
+            }
+
+      - name: Calculate next version
+        id: calculate-version
+        run: |
+          # Determine the version bump based on the branch type
+          BRANCH_TYPE="${{ steps.set-branch-type.outputs.branch_type }}"
+          echo "Branch type: $BRANCH_TYPE"
+          
+          # Make sure to fetch all tags
+          git fetch --tags --force
+          
+          # Get all dev tags and extract version numbers from them
+          DEV_TAGS=$(git tag -l "dev-v*" | sort -V)
+          
+          # If no dev tags, check if there are any regular 'v' tags to extract versions from
+          if [ -z "$DEV_TAGS" ]; then
+            REGULAR_TAGS=$(git tag -l "v*" | grep -v "dev-" | sort -V)
+            if [ -n "$REGULAR_TAGS" ]; then
+              # Use the latest regular tag version
+              LATEST_TAG=$(echo "$REGULAR_TAGS" | tail -n 1)
+              echo "No dev tags found. Using version from regular tag: $LATEST_TAG"
+            else
+              # No tags at all, start with 0.0.0
+              LATEST_TAG="v0.0.0"
+              echo "No tags found. Starting with: $LATEST_TAG"
+            fi
+          else
+            # Extract the semantic version from the latest dev tag
+            LATEST_DEV_TAG=$(echo "$DEV_TAGS" | tail -n 1)
+            LATEST_TAG="v$(echo "$LATEST_DEV_TAG" | sed -E 's/dev-v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+            echo "Latest version from dev tags: $LATEST_TAG"
+          fi
+          
+          # Remove 'v' prefix for version calculations
+          LATEST_VERSION=${LATEST_TAG#v}
+          
+          # Split into major, minor, patch and validate
+          MAJOR=$(echo $LATEST_VERSION | cut -d. -f1)
+          MINOR=$(echo $LATEST_VERSION | cut -d. -f2)
+          PATCH=$(echo $LATEST_VERSION | cut -d. -f3)
+          
+          # Validate parts - if any part is empty or non-numeric, set to 0
+          [[ -z "$MAJOR" || ! "$MAJOR" =~ ^[0-9]+$ ]] && MAJOR=0
+          [[ -z "$MINOR" || ! "$MINOR" =~ ^[0-9]+$ ]] && MINOR=0
+          [[ -z "$PATCH" || ! "$PATCH" =~ ^[0-9]+$ ]] && PATCH=0
+          
+          echo "Current version components: Major=$MAJOR, Minor=$MINOR, Patch=$PATCH"
+          
+          # Calculate new version based on branch type
+          if [[ "$BRANCH_TYPE" == "feature" ]]; then
+            NEW_VERSION="$MAJOR.$((MINOR + 1)).0"
+          elif [[ "$BRANCH_TYPE" == "breaking" ]]; then
+            NEW_VERSION="$((MAJOR + 1)).0.0"
+          elif [[ "$BRANCH_TYPE" == "bug" || "$BRANCH_TYPE" == "bugfix" || "$BRANCH_TYPE" == "maintenance" ]]; then
+            NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
+          elif [[ "$BRANCH_TYPE" == "chore" || "$BRANCH_TYPE" == "rc" ]]; then
+            # No version bump for chore or rc branches
+            NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+          else
+            # Default to patch for unknown branch types
+            NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
+          fi
+          
+          echo "New version: $NEW_VERSION"
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Set image tag
+        id: set-image-tag
+        run: |
+          NEW_VERSION="${{ steps.calculate-version.outputs.new_version }}"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          SHORT_SHA="${{ github.event.pull_request.merge_commit_sha }}"
+          
+          # Debug variable values before constructing image name
+          echo "🔍 Debug values for image construction:"
+          echo "NEW_VERSION: $NEW_VERSION"
+          echo "TIMESTAMP: $TIMESTAMP"
+          echo "SHORT_SHA: ${SHORT_SHA:0:7}"
+          echo "KUBECORE_REGISTRY: '${{ env.KUBECORE_REGISTRY }}'"
+          echo "KUBECORE_KUBEPROJECT_REPO: '${{ env.KUBECORE_KUBEPROJECT_REPO }}'"
+          echo "APP_NAME: '${{ env.APP_NAME }}'"
+          
+          # Dev version format: dev-v1.2.3-20230506-abc1234
+          IMAGE_TAG="dev-v${NEW_VERSION}-${TIMESTAMP}-${SHORT_SHA:0:7}"
+          FULL_IMAGE_NAME="${{ env.KUBECORE_REGISTRY }}/${{ env.KUBECORE_KUBEPROJECT_REPO }}/${{ env.APP_NAME }}:${IMAGE_TAG}"
+          
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "full_image_name=${FULL_IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "🏷️ Final Results:"
+          echo "Image tag: ${IMAGE_TAG}"
+          echo "Full image name: ${FULL_IMAGE_NAME}"
+          
+      - name: Create dev tag
+        if: steps.set-branch-type.outputs.branch_type != 'chore' && steps.set-branch-type.outputs.branch_type != 'rc'
+        run: |
+          NEW_VERSION="${{ steps.calculate-version.outputs.new_version }}"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          DEV_TAG="dev-v${NEW_VERSION}-${TIMESTAMP}"
+          
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          
+          # Create and push only the dev tag
+          git tag -a "${DEV_TAG}" -m "Dev release v${NEW_VERSION}"
+          git push origin "${DEV_TAG}"
+          
+          echo "Created and pushed tag: ${DEV_TAG}"
+
+  build-dev-image:
+    needs: handle-merged-pr
+    if: needs.handle-merged-pr.outputs.branch_type != 'chore' && needs.handle-merged-pr.outputs.branch_type != 'rc' && github.event_name == 'pull_request_target' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+      
+      - name: Debug environment variables
+        run: |
+          echo "🔍 Debugging Environment Variables:"
+          echo "KUBECORE_REGISTRY: '${{ env.KUBECORE_REGISTRY }}'"
+          echo "KUBECORE_KUBEPROJECT_REPO: '${{ env.KUBECORE_KUBEPROJECT_REPO }}'"
+          echo "APP_NAME: '${{ env.APP_NAME }}'"
+          echo "KUBECORE_REGISTRY_UNAME: [$(if [ -n '${{ env.KUBECORE_REGISTRY_UNAME }}' ]; then echo 'SET'; else echo 'EMPTY'; fi)]"
+          echo "KUBECORE_REGISTRY_PWD: [$(if [ -n '${{ env.KUBECORE_REGISTRY_PWD }}' ]; then echo 'SET'; else echo 'EMPTY'; fi)]"
+          echo "📋 Variable lengths:"
+          echo "KUBECORE_REGISTRY length: ${#KUBECORE_REGISTRY}"
+          echo "KUBECORE_KUBEPROJECT_REPO length: ${#KUBECORE_KUBEPROJECT_REPO}"
+          
+      - name: Set build variables
+        run: |
+          # KUBECORE_REGISTRY already contains full repository path
+          # Extract registry host for docker login
+          REGISTRY_HOST=$(echo "${{ env.KUBECORE_REGISTRY }}" | cut -d'/' -f1)
+          echo "REGISTRY_HOST=${REGISTRY_HOST}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${{ needs.handle-merged-pr.outputs.image_tag }}" >> $GITHUB_ENV
+          echo "FULL_IMAGE_NAME=${{ env.KUBECORE_REGISTRY }}:${{ needs.handle-merged-pr.outputs.image_tag }}" >> $GITHUB_ENV
+
+      - name: Login to private registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY_HOST }}
+          username: ${{ env.KUBECORE_REGISTRY_UNAME }}
+          password: ${{ env.KUBECORE_REGISTRY_PWD }}
+          ecr: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          file: ./app/Dockerfile
+          push: true
+          tags: ${{ env.FULL_IMAGE_NAME }}
+          provenance: false
+          build-args: |
+            REGISTRY_URL=${{ env.KUBECORE_REGISTRY }}
+            KUBECORE_KUBEPROJECT_REPO=${{ env.KUBECORE_KUBEPROJECT_REPO }}
+            VERSION=${{ needs.handle-merged-pr.outputs.image_tag }}
+
+  notify-gitops-repository:
+    needs: [handle-merged-pr, build-dev-image]
+    if: needs.handle-merged-pr.outputs.branch_type != 'chore' && needs.handle-merged-pr.outputs.branch_type != 'rc' && github.event_name == 'pull_request_target' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate token
+        id: create_token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.KUBECORE_APP_ID }}
+          private_key: ${{ secrets.KUBECORE_APP_PKEY }}
+
+      - name: Dispatch Dev Environment Update Event
+        uses: peter-evans/repository-dispatch@v2
+        with:
+          token: ${{ steps.create_token.outputs.token }}
+          event-type: dev-environment-update
+          repository: ${{ github.repository_owner }}/${{ env.KUBECORE_KUBEPROJECT_REPO }}
+          client-payload: >-
+            {
+              "version": "${{ needs.handle-merged-pr.outputs.image_tag }}",
+              "image": "${{ needs.handle-merged-pr.outputs.full_image_name }}",
+              "app_name": "${{ env.APP_NAME }}",
+              "semantic_version": "v${{ needs.handle-merged-pr.outputs.new_version }}",
+              "branch_type": "${{ needs.handle-merged-pr.outputs.branch_type }}",
+              "pr_title": "${{ github.event.pull_request.title }}",
+              "pr_url": "${{ github.event.pull_request.html_url }}",
+              "plain_image_name": "${{ env.KUBECORE_REGISTRY }}"
+            }
+
+      - name: Comment on PR about dev deployment
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🚀 Dev Deployment Initiated
+              
+              Your changes have been merged to the dev branch and a new dev deployment is being processed.
+              
+              - **Image**: \`${{ needs.handle-merged-pr.outputs.full_image_name }}\`
+              - **Version**: \`v${{ needs.handle-merged-pr.outputs.new_version }}\`
+              
+              The GitOps repository is being updated to deploy this new version to the dev environment.`
+            })
+
+  # This job creates an RC branch when the PR has the 'create-rc🚀' label
+  create-rc-branch:
+    needs: [handle-merged-pr, build-dev-image, notify-gitops-repository]
+    if: needs.handle-merged-pr.outputs.create_rc_branch == 'true' && needs.handle-merged-pr.outputs.branch_type != 'chore' && needs.handle-merged-pr.outputs.branch_type != 'rc' && github.event_name == 'pull_request_target' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      rc_branch: ${{ steps.set-rc-branch.outputs.rc_branch }}
+      pr_number: ${{ steps.create-pr.outputs.pr_number }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: '0'  # Fetch all history for branch creation
+          ref: dev  # Make sure we're using the latest dev branch
+
+      - name: Set RC branch name
+        id: set-rc-branch
+        run: |
+          NEW_VERSION="${{ needs.handle-merged-pr.outputs.new_version }}"
+          RC_BRANCH="rc/v${NEW_VERSION}"
+          echo "rc_branch=${RC_BRANCH}" >> $GITHUB_OUTPUT
+          echo "RC branch will be: ${RC_BRANCH}"
+
+      - name: Generate token
+        id: create_token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.KUBECORE_APP_ID }}
+          private_key: ${{ secrets.KUBECORE_APP_PKEY }}
+
+      - name: Create RC branch
+        id: create-rc
+        uses: peterjgrainger/action-create-branch@v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ steps.create_token.outputs.token }}
+        with:
+          branch: '${{ steps.set-rc-branch.outputs.rc_branch }}'
+          sha: '${{ github.event.pull_request.head.sha }}'
+
+      - name: Create PR from RC branch to main
+        id: create-pr
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ steps.create_token.outputs.token }}
+          script: |
+            const rcBranch = '${{ steps.set-rc-branch.outputs.rc_branch }}';
+            const version = '${{ needs.handle-merged-pr.outputs.new_version }}';
+            const originalPrTitle = '${{ github.event.pull_request.title }}';
+            const originalPrUrl = '${{ github.event.pull_request.html_url }}';
+            const branchType = '${{ needs.handle-merged-pr.outputs.branch_type }}';
+            
+            // Generate PR title and body
+            const prTitle = `🚀 Release v${version}`;
+            const prBody = `## Release Candidate v${version}
+            
+            This PR contains the release candidate for version **v${version}**.
+            
+            ### 📋 Release Information
+            - **Version**: v${version}
+            - **Branch Type**: ${branchType}
+            - **Source**: ${rcBranch}
+            - **Target**: main
+            
+            ### 🔗 Original Changes
+            - **Original PR**: [${originalPrTitle}](${originalPrUrl})
+            
+            ### 🎯 Next Steps
+            1. Review the changes in this PR
+            2. Merge this PR to main to create the official release
+            3. The main branch merge will trigger production deployment workflows
+            
+            ### 📝 Release Notes
+            This release includes:
+            - ${originalPrTitle}
+            
+            ---
+            
+            _This PR was automatically created by the CI/CD pipeline when the \`create-rc🚀\` label was applied to the original PR._`;
+            
+            try {
+              const response = await github.rest.pulls.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: prTitle,
+                head: rcBranch,
+                base: 'main',
+                body: prBody,
+                draft: false
+              });
+              
+              console.log(`Created PR #${response.data.number}: ${response.data.html_url}`);
+              core.setOutput('pr_number', response.data.number);
+              core.setOutput('pr_url', response.data.html_url);
+              
+              return response.data.number;
+            } catch (error) {
+              console.error('Error creating PR:', error);
+              core.setFailed(`Failed to create PR: ${error.message}`);
+              throw error;
+            }
+
+      - name: Comment on original PR about RC branch and PR creation
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const rcBranch = '${{ steps.set-rc-branch.outputs.rc_branch }}';
+            const prNumber = '${{ steps.create-pr.outputs.pr_number }}';
+            const prUrl = '${{ steps.create-pr.outputs.pr_url }}';
+            const repoUrl = 'https://github.com/${{ github.repository }}';
+            const version = '${{ needs.handle-merged-pr.outputs.new_version }}';
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🏷️ Release Candidate Created & PR Opened
+              
+              A release candidate has been created and a PR to main has been automatically opened:
+              
+              ### 🌿 RC Branch
+              - **Branch name**: \`${rcBranch}\`
+              - **Branch URL**: [${rcBranch}](${repoUrl}/tree/${rcBranch})
+              
+              ### 📋 Release PR
+              - **PR Number**: #${prNumber}
+              - **PR URL**: [Release v${version}](${prUrl})
+              - **Target**: main branch
+              
+              ### 🎯 Next Steps
+              1. Review the [Release PR #${prNumber}](${prUrl})
+              2. Merge the Release PR to main to create the official release
+              3. The main branch merge will trigger production deployment workflows
+              
+              _The RC workflow will automatically detect the new branch and create appropriate release candidate builds._`
+            })
+
+  # Notify when no RC branch is created but could be
+  notify-rc-option:
+    needs: [handle-merged-pr, build-dev-image, notify-gitops-repository]
+    if: needs.handle-merged-pr.outputs.create_rc_branch != 'true' && needs.handle-merged-pr.outputs.branch_type != 'chore' && needs.handle-merged-pr.outputs.branch_type != 'rc' && github.event_name == 'pull_request_target' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment on PR about manual RC branch creation
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 📝 Release Candidate Option
+              
+              If you would like to create a release candidate from this change, you have three options:
+
+              1. **Create an RC branch from workflow**:
+                This will create an RC branch from the dev branch and push it to the remote repository.
+                https://github.com/novelcore/${{env.APP_NAME}}/actions/workflows/manual-create-rc.yaml
+                You have to select the \`dev\` branch as the originator, otherwise it will fail.
+                The \`SMV tag\` will be automatically generated from the latest dev release !
+
+              2. **Manually create an RC branch**:
+                 \`\`\`bash
+                 git checkout dev
+                 git pull
+                 git checkout -b rc/v${{ needs.handle-merged-pr.outputs.new_version }}
+                 git push origin rc/v${{ needs.handle-merged-pr.outputs.new_version }}
+                 \`\`\`
+              
+              3. **For future PRs**: Add the \`create-rc🚀\` label to automatically create an RC branch upon merge.
+              
+              Once an RC branch exists, the RC workflow will build the appropriate release candidate images and handle promotion to staging.`
+            })
+              
+  # Log when workflow is skipped (this will be very fast)
+  log-merge-back-skip:
+    needs: gate-check  
+    if: needs.gate-check.outputs.is_merge_back == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log merge-back skip
+        run: |
+          echo "::notice title=Merge-back Detected::Workflow skipped for merge from ${{ github.head_ref || github.event.pull_request.head.ref }} to dev"
+          echo "This is expected behavior for merge-back operations."
+          echo "Merge-backs do not require new builds, version bumps, or deployments."

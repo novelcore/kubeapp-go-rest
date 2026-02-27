@@ -1,0 +1,448 @@
+name: 🔥 Hotfix - Expedited Production Release 🔥
+
+on:
+  # Trigger on hotfix branch push
+  push:
+    branches:
+      - 'hotfix/*'
+  
+  # Trigger when hotfix PR is merged to main
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - closed
+
+env:
+  KUBECORE_REGISTRY: ${{ vars.KUBECORE_REGISTRY }}
+  KUBECORE_REGISTRY_UNAME: ${{ secrets.KUBECORE_REGISTRY_UNAME }}
+  KUBECORE_REGISTRY_PWD: ${{ secrets.KUBECORE_REGISTRY_PWD }}
+  KUBECORE_KUBEPROJECT_REPO: ${{ vars.KUBECORE_KUBEPROJECT_REPO }}
+  APP_NAME: ${{ github.event.repository.name }}
+  SHORT_SHA: ${{ github.sha }}
+
+jobs:
+  # Build hotfix image when pushing to hotfix branch
+  build-hotfix-image:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/hotfix/')
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.set-image-tag.outputs.image_tag }}
+      full_image_name: ${{ steps.set-image-tag.outputs.full_image_name }}
+      hotfix_version: ${{ steps.calculate-version.outputs.hotfix_version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: '0'
+      
+      - name: Calculate hotfix version
+        id: calculate-version
+        run: |
+          # Get the latest production tag
+          git fetch --tags --force
+          PROD_TAGS=$(git tag -l "v*" | grep -v "\-rc" | grep -v "\-hotfix" | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+$" | sort -V)
+          
+          if [ -z "$PROD_TAGS" ]; then
+            echo "ERROR: No production tags found. Cannot create hotfix without a production release."
+            exit 1
+          fi
+          
+          LATEST_PROD_TAG=$(echo "$PROD_TAGS" | tail -n 1)
+          echo "Latest production tag: $LATEST_PROD_TAG"
+          
+          # Extract version and increment patch
+          VERSION=${LATEST_PROD_TAG#v}
+          MAJOR=$(echo $VERSION | cut -d. -f1)
+          MINOR=$(echo $VERSION | cut -d. -f2)
+          PATCH=$(echo $VERSION | cut -d. -f3)
+          
+          NEW_PATCH=$((PATCH + 1))
+          HOTFIX_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
+          
+          echo "Hotfix version: $HOTFIX_VERSION"
+          echo "hotfix_version=$HOTFIX_VERSION" >> $GITHUB_OUTPUT
+      
+      - name: Set image tag
+        id: set-image-tag
+        run: |
+          # KUBECORE_REGISTRY already contains full repository path
+          REGISTRY_HOST=$(echo "${{ env.KUBECORE_REGISTRY }}" | cut -d'/' -f1)
+          echo "REGISTRY_HOST=${REGISTRY_HOST}" >> $GITHUB_ENV
+          HOTFIX_VERSION="${{ steps.calculate-version.outputs.hotfix_version }}"
+          # Format: v1.2.3-hotfix-abc123
+          IMAGE_TAG="v${HOTFIX_VERSION}-hotfix-${SHORT_SHA:0:7}"
+          FULL_IMAGE_NAME="${{ env.KUBECORE_REGISTRY }}:${IMAGE_TAG}"
+
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "full_image_name=${FULL_IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "Hotfix image tag: ${IMAGE_TAG}"
+
+      - name: Login to private registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY_HOST }}
+          username: ${{ env.KUBECORE_REGISTRY_UNAME }}
+          password: ${{ env.KUBECORE_REGISTRY_PWD }}
+          ecr: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./app
+          file: ./app/Dockerfile
+          push: true
+          tags: ${{ steps.set-image-tag.outputs.full_image_name }}
+          provenance: false
+          build-args: |
+            REGISTRY_URL=${{ env.KUBECORE_REGISTRY }}
+            KUBECORE_KUBEPROJECT_REPO=${{ env.KUBECORE_KUBEPROJECT_REPO }}
+            VERSION=${{ steps.set-image-tag.outputs.image_tag }}
+      
+      - name: Create PR to main
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const hotfixBranch = context.ref.replace('refs/heads/', '');
+            const hotfixVersion = '${{ steps.calculate-version.outputs.hotfix_version }}';
+            const imageTag = '${{ steps.set-image-tag.outputs.image_tag }}';
+            
+            // Check if PR already exists
+            const { data: existingPRs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${hotfixBranch}`,
+              base: 'main',
+              state: 'open'
+            });
+            
+            if (existingPRs.length > 0) {
+              console.log(`PR already exists: ${existingPRs[0].html_url}`);
+              
+              // Update PR description with latest build info
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: existingPRs[0].number,
+                body: existingPRs[0].body + `\n\n### Latest Build\n- Image: \`${imageTag}\`\n- Built at: ${new Date().toISOString()}`
+              });
+              return;
+            }
+            
+            // Create PR to main
+            const pr = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🔥 HOTFIX: v${hotfixVersion}`,
+              body: `## 🚨 Critical Hotfix
+              
+              This is an expedited hotfix that needs to be deployed to production immediately.
+              
+              ### Hotfix Information
+              - **Version**: \`v${hotfixVersion}\`
+              - **Image**: \`${imageTag}\`
+              - **Branch**: \`${hotfixBranch}\`
+              
+              ### Checklist
+              - [ ] Critical issue has been fixed
+              - [ ] Minimal testing completed
+              - [ ] Risk assessment done
+              - [ ] Rollback plan ready
+              
+              ### Deployment Process
+              1. This PR will be fast-tracked for review
+              2. Upon merge, it will be automatically deployed to production
+              3. A sync PR will be created to merge these changes back to dev
+              
+              ⚠️ **This is an expedited release. Please review carefully but quickly.**`,
+              head: hotfixBranch,
+              base: 'main',
+              maintainer_can_modify: true
+            });
+            
+            console.log(`Created hotfix PR: ${pr.data.html_url}`);
+            
+            // Add labels
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.data.number,
+              labels: ['hotfix', 'critical', 'expedited']
+            });
+            
+            // Request reviews from senior team members
+            try {
+              await github.rest.pulls.requestReviewers({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.data.number,
+                reviewers: [], // Add your senior reviewer usernames here
+                team_reviewers: ['release-managers'] // Add your team names here
+              });
+            } catch (error) {
+              console.log('Could not request reviewers:', error.message);
+            }
+
+  # Handle merged hotfix to main
+  deploy-hotfix:
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'hotfix/')
+    runs-on: ubuntu-latest
+    outputs:
+      production_tag: ${{ steps.create-tag.outputs.production_tag }}
+      full_image_name: ${{ steps.build-prod-image.outputs.full_image_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: '0'
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+      
+      - name: Extract hotfix version
+        id: extract-version
+        run: |
+          # Get the hotfix version from PR title or calculate it
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          
+          # Try to extract version from PR title (format: "🔥 HOTFIX: v1.2.3")
+          if [[ "$PR_TITLE" =~ v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            HOTFIX_VERSION="${BASH_REMATCH[1]}"
+          else
+            # Fallback: calculate from latest prod tag
+            git fetch --tags --force
+            PROD_TAGS=$(git tag -l "v*" | grep -v "\-rc" | grep -v "\-hotfix" | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+$" | sort -V)
+            LATEST_PROD_TAG=$(echo "$PROD_TAGS" | tail -n 1)
+            VERSION=${LATEST_PROD_TAG#v}
+            MAJOR=$(echo $VERSION | cut -d. -f1)
+            MINOR=$(echo $VERSION | cut -d. -f2)
+            PATCH=$(echo $VERSION | cut -d. -f3)
+            HOTFIX_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          fi
+          
+          echo "Hotfix version: $HOTFIX_VERSION"
+          echo "hotfix_version=$HOTFIX_VERSION" >> $GITHUB_OUTPUT
+      
+      - name: Create production tag
+        id: create-tag
+        run: |
+          PRODUCTION_TAG="v${{ steps.extract-version.outputs.hotfix_version }}"
+          
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          
+          # Create annotated tag
+          git tag -a "${PRODUCTION_TAG}" -m "Hotfix release ${PRODUCTION_TAG}"
+          git push origin "${PRODUCTION_TAG}"
+          
+          echo "Created production tag: ${PRODUCTION_TAG}"
+          echo "production_tag=${PRODUCTION_TAG}" >> $GITHUB_OUTPUT
+      
+      - name: Build production image
+        id: build-prod-image
+        run: |
+          PRODUCTION_TAG="${{ steps.create-tag.outputs.production_tag }}"
+          FULL_IMAGE_NAME="${{ env.KUBECORE_REGISTRY }}:${PRODUCTION_TAG}"
+          
+          echo "full_image_name=${FULL_IMAGE_NAME}" >> $GITHUB_OUTPUT
+          
+          # Login to registry
+          echo "${{ env.KUBECORE_REGISTRY_PWD }}" | docker login ${{ env.KUBECORE_REGISTRY }} -u ${{ env.KUBECORE_REGISTRY_UNAME }} --password-stdin
+          
+          # Build and push production image
+          docker build -t "${FULL_IMAGE_NAME}" \
+            --build-arg REGISTRY_URL=${{ env.KUBECORE_REGISTRY }} \
+            --build-arg KUBECORE_KUBEPROJECT_REPO=${{ env.KUBECORE_KUBEPROJECT_REPO }} \
+            --build-arg VERSION=${PRODUCTION_TAG} \
+            ./app
+          
+          docker push "${FULL_IMAGE_NAME}"
+
+          # Also tag as latest
+          docker tag "${FULL_IMAGE_NAME}" "${{ env.KUBECORE_REGISTRY }}:latest"
+          docker push "${{ env.KUBECORE_REGISTRY }}:latest"
+
+  # Notify GitOps for expedited deployment
+  notify-gitops-expedited:
+    needs: deploy-hotfix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate token
+        id: create_token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.KUBECORE_APP_ID }}
+          private_key: ${{ secrets.KUBECORE_APP_PKEY }}
+
+      - name: Dispatch Expedited Production Update
+        uses: peter-evans/repository-dispatch@v2
+        with:
+          token: ${{ steps.create_token.outputs.token }}
+          event-type: hotfix-production-update
+          repository: ${{ github.repository_owner }}/${{ env.KUBECORE_KUBEPROJECT_REPO }}
+          client-payload: >-
+            {
+              "version": "${{ needs.deploy-hotfix.outputs.production_tag }}",
+              "image": "${{ needs.deploy-hotfix.outputs.full_image_name }}",
+              "app_name": "${{ env.APP_NAME }}",
+              "pr_title": "${{ github.event.pull_request.title }}",
+              "pr_url": "${{ github.event.pull_request.html_url }}",
+              "pr_number": "${{ github.event.pull_request.number }}",
+              "merged_by": "${{ github.event.pull_request.merged_by.login }}",
+              "is_hotfix": true,
+              "expedited": true,
+              "plain_image_name": "${{ env.KUBECORE_REGISTRY }}"
+            }
+
+  # Create GitHub release for hotfix
+  create-hotfix-release:
+    needs: [deploy-hotfix, notify-gitops-expedited]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: '0'
+      
+      - name: Create GitHub Release
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const productionTag = '${{ needs.deploy-hotfix.outputs.production_tag }}';
+            const prBody = `${{ github.event.pull_request.body }}`;
+            
+            // Extract key information from PR
+            const changelog = `# Hotfix Release ${productionTag}
+            
+            **⚠️ This is a critical hotfix release**
+            
+            ## Changes
+            ${prBody}
+            
+            ## Deployment
+            - Deployed directly to production
+            - Bypassed standard release process due to critical nature
+            
+            ## Pull Request
+            - PR: #${{ github.event.pull_request.number }}
+            - Merged by: @${{ github.event.pull_request.merged_by.login }}
+            `;
+            
+            try {
+              const release = await github.rest.repos.createRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: productionTag,
+                name: `Hotfix Release ${productionTag}`,
+                body: changelog,
+                draft: false,
+                prerelease: false
+              });
+              
+              console.log(`Created hotfix release: ${release.data.html_url}`);
+            } catch (error) {
+              console.error('Error creating release:', error);
+            }
+
+  # Sync hotfix back to dev
+  sync-hotfix-to-dev:
+    needs: [deploy-hotfix, create-hotfix-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: '0'
+      
+      - name: Generate token
+        id: create_token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.KUBECORE_APP_ID }}
+          private_key: ${{ secrets.KUBECORE_APP_PKEY }}
+      
+      - name: Create sync PR to dev
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ steps.create_token.outputs.token }}
+          script: |
+            const productionTag = '${{ needs.deploy-hotfix.outputs.production_tag }}';
+            const hotfixBranch = '${{ github.event.pull_request.head.ref }}';
+            
+            try {
+              // Create PR from main to dev (not from hotfix branch)
+              const pr = await github.rest.pulls.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `🔄 Sync hotfix ${productionTag} to dev`,
+                body: `## Hotfix Synchronization
+                
+                This PR syncs the critical hotfix changes from production back to the development branch.
+                
+                ### Hotfix Information
+                - **Version**: \`${productionTag}\`
+                - **Original Branch**: \`${hotfixBranch}\`
+                - **Original PR**: #${{ github.event.pull_request.number }}
+                
+                ### Important
+                ⚠️ **This PR must be merged to keep dev in sync with production.**
+                
+                The hotfix has already been deployed to production. This merge ensures that the development branch includes these critical fixes.`,
+                head: 'main',
+                base: 'dev',
+                maintainer_can_modify: true
+              });
+              
+              console.log(`Created sync PR: ${pr.data.html_url}`);
+              
+              // Add labels
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.data.number,
+                labels: ['sync', 'hotfix', 'automated']
+              });
+              
+            } catch (error) {
+              console.error('Error creating sync PR:', error);
+            }
+
+  # Final summary
+  hotfix-summary:
+    needs: [deploy-hotfix, notify-gitops-expedited, create-hotfix-release, sync-hotfix-to-dev]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/hotfix/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment on PR
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.issues.createComment({
+              issue_number: ${{ github.event.pull_request.number }},
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🔥 Hotfix Deployed to Production!
+              
+              The critical hotfix has been successfully deployed:
+              
+              - ✅ **Version**: \`${{ needs.deploy-hotfix.outputs.production_tag }}\`
+              - ✅ **Image**: \`${{ needs.deploy-hotfix.outputs.full_image_name }}\`
+              - ✅ **Deployment**: Expedited to production via GitOps
+              - ✅ **Release**: GitHub release created
+              - ✅ **Sync**: PR created to sync changes back to dev
+              
+              ### Next Steps
+              1. Monitor the production deployment closely
+              2. Verify the hotfix resolves the critical issue
+              3. Ensure the dev sync PR is merged promptly
+              4. Consider a follow-up release with proper testing`
+            })

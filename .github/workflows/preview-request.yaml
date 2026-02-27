@@ -1,0 +1,611 @@
+name: 🔭 Request a preview against Dev 🔭
+
+on:
+  pull_request_target:
+    branches:
+      - dev
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
+      - unlabeled
+      - closed
+
+env:
+  KUBECORE_REGISTRY: ${{ vars.KUBECORE_REGISTRY }}
+  KUBECORE_REGISTRY_UNAME: ${{ secrets.KUBECORE_REGISTRY_UNAME }}
+  KUBECORE_REGISTRY_PWD: ${{ secrets.KUBECORE_REGISTRY_PWD }}
+  KUBECORE_KUBEPROJECT_REPO: ${{ vars.KUBECORE_KUBEPROJECT_REPO }}
+  KUBECORE_KUBEPROJECT_DOMAIN: ${{ vars.KUBECORE_KUBEPROJECT_DOMAIN }}
+  APP_NAME: ${{ github.event.repository.name }}
+  PR_NUMBER: ${{ github.event.pull_request.number }}
+  SHORT_SHA: ${{ github.event.pull_request.head.sha }}
+  BRANCH_TYPE: ${{ github.head_ref && startsWith(github.head_ref, 'feature/') && 'feature' || startsWith(github.head_ref, 'bug/') && 'bug' || startsWith(github.head_ref, 'bugfix/') && 'bugfix' || startsWith(github.head_ref, 'breaking/') && 'breaking' || 'other' }}
+  # UPDATED: Per-PR environment naming
+  ENVIRONMENT_NAME: 'preview-pr-${{ github.event.pull_request.number }}'
+
+jobs:
+  # ENHANCED GATE JOB - Fast exit with proper label validation
+  gate-check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_process: ${{ steps.check.outputs.should_process }}
+      has_preview_label: ${{ steps.check.outputs.has_preview_label }}
+      is_merge_back: ${{ steps.check.outputs.is_merge_back }}
+      is_cleanup: ${{ steps.check.outputs.is_cleanup }}
+      is_label_removal: ${{ steps.check.outputs.is_label_removal }}
+      action_type: ${{ steps.check.outputs.action_type }}
+    steps:
+      - name: Check if workflow should proceed with label validation
+        id: check
+        run: |
+          SOURCE_BRANCH="${{ github.event.pull_request.head.ref }}"
+          PR_ACTION="${{ github.event.action }}"
+          LABEL_NAME="${{ github.event.label.name }}"
+          echo "🔍 Gate Check Analysis:"
+          echo "  Source branch: $SOURCE_BRANCH"
+          echo "  PR Action: $PR_ACTION"
+          echo "  Label involved: $LABEL_NAME"
+          
+          # Initialize outputs
+          echo "should_process=false" >> $GITHUB_OUTPUT
+          echo "has_preview_label=false" >> $GITHUB_OUTPUT
+          echo "is_merge_back=false" >> $GITHUB_OUTPUT
+          echo "is_cleanup=false" >> $GITHUB_OUTPUT
+          echo "is_label_removal=false" >> $GITHUB_OUTPUT
+          echo "action_type=none" >> $GITHUB_OUTPUT
+          
+          # Check if this is a cleanup action (PR closed)
+          if [[ "$PR_ACTION" == "closed" ]]; then
+            echo "is_cleanup=true" >> $GITHUB_OUTPUT
+            echo "should_process=true" >> $GITHUB_OUTPUT
+            echo "action_type=pr_cleanup" >> $GITHUB_OUTPUT
+            echo "🧹 CLEANUP: PR closed, will clean up preview environment"
+            exit 0
+          fi
+          
+          # Check if this is preview label removal
+          if [[ "$PR_ACTION" == "unlabeled" && "$LABEL_NAME" == "preview" ]]; then
+            echo "is_label_removal=true" >> $GITHUB_OUTPUT
+            echo "should_process=true" >> $GITHUB_OUTPUT
+            echo "action_type=label_cleanup" >> $GITHUB_OUTPUT
+            echo "🏷️ CLEANUP: Preview label removed, will clean up preview environment"
+            exit 0
+          fi
+          
+          # Skip if non-preview label was removed
+          if [[ "$PR_ACTION" == "unlabeled" && "$LABEL_NAME" != "preview" ]]; then
+            echo "action_type=skip_unlabel" >> $GITHUB_OUTPUT
+            echo "ℹ️ SKIPPING: Non-preview label removed ($LABEL_NAME)"
+            exit 0
+          fi
+          
+          # CRITICAL: Skip if non-preview label was added
+          if [[ "$PR_ACTION" == "labeled" && "$LABEL_NAME" != "preview" ]]; then
+            echo "action_type=skip_other_label" >> $GITHUB_OUTPUT
+            echo "ℹ️ SKIPPING: Non-preview label added ($LABEL_NAME) - no action needed"
+            exit 0
+          fi
+          
+          # Check if this is a merge-back from main or rc
+          if [[ "$SOURCE_BRANCH" == "main" || "$SOURCE_BRANCH" =~ ^rc/ ]]; then
+            echo "is_merge_back=true" >> $GITHUB_OUTPUT
+            echo "action_type=merge_back" >> $GITHUB_OUTPUT
+            echo "⏭️ SKIPPING: Preview workflow does not run for merge-backs from $SOURCE_BRANCH"
+            echo "::notice title=Preview Skipped::Merge-back detected from $SOURCE_BRANCH - preview environments not created for merge-backs"
+            exit 0
+          fi
+          
+          # Check for preview label on eligible branches
+          LABELS="${{ toJson(github.event.pull_request.labels.*.name) }}"
+          if [[ "$LABELS" == *"preview"* ]]; then
+            echo "has_preview_label=true" >> $GITHUB_OUTPUT
+            echo "should_process=true" >> $GITHUB_OUTPUT
+            echo "action_type=create_preview" >> $GITHUB_OUTPUT
+            echo "✅ PROCEEDING: Preview label found on eligible branch $SOURCE_BRANCH"
+            
+            # Additional validation for labeled action
+            if [[ "$PR_ACTION" == "labeled" && "$LABEL_NAME" == "preview" ]]; then
+              echo "🏷️ TRIGGER: Preview label was just added - creating preview environment"
+            elif [[ "$PR_ACTION" == "labeled" ]]; then
+              echo "ℹ️ This shouldn't happen - non-preview labels should be filtered out above"
+            else
+              echo "ℹ️ PROCEEDING: Preview label exists on $PR_ACTION action"
+            fi
+          else
+            echo "action_type=no_preview_label" >> $GITHUB_OUTPUT
+            echo "ℹ️ SKIPPING: No preview label on $SOURCE_BRANCH"
+          fi
+          
+          echo "Branch type: ${{ env.BRANCH_TYPE }}"
+
+  # Fast job for non-preview labels - provides clear feedback
+  log-other-label-skip:
+    needs: gate-check
+    if: needs.gate-check.outputs.action_type == 'skip_other_label'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log non-preview label skip
+        run: |
+          echo "::notice title=Preview Skipped for Label::Label '${{ github.event.label.name }}' was added, but only the 'preview' label triggers preview environments"
+          echo "ℹ️ The '${{ github.event.label.name }}' label was added to PR #${{ github.event.pull_request.number }}"
+          echo "ℹ️ Preview environments are only created when the 'preview' label is added"
+          echo "ℹ️ To create a preview environment, add the 'preview' label to this PR"
+
+
+  # Ensure GitHub Environment exists (per-PR)
+  ensure-environment:
+    needs: gate-check
+    if: needs.gate-check.outputs.should_process == 'true' && needs.gate-check.outputs.has_preview_label == 'true' && needs.gate-check.outputs.is_cleanup == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate GitHub App token
+        id: create_token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.KUBECORE_APP_ID }}
+          private_key: ${{ secrets.KUBECORE_APP_PKEY }}
+
+      - name: Check and create per-PR preview environment
+        id: environment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.create_token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,403,404,422
+          script: |
+            const environmentName = '${{env.ENVIRONMENT_NAME}}';
+            console.log(`Working with environment: ${environmentName}`);
+            
+            try {
+              // Try to get the environment
+              const { data: environment } = await github.rest.repos.getEnvironment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                environment_name: environmentName
+              });
+              
+              console.log(`✅ Environment '${environmentName}' already exists`);
+              core.setOutput('environment_exists', 'true');
+              core.setOutput('environment_created', 'false');
+              
+            } catch (error) {
+              if (error.status === 404) {
+                console.log(`🔧 Environment '${environmentName}' not found, creating it...`);
+                
+                try {
+                  // Create the per-PR environment (minimal - no protection rules)
+                  const { data: newEnvironment } = await github.rest.repos.createOrUpdateEnvironment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    environment_name: environmentName
+                    // Removed protection rules due to billing plan limitations
+                  });
+                  
+                  console.log(`✅ Successfully created environment '${environmentName}'`);
+                  core.setOutput('environment_exists', 'true');
+                  core.setOutput('environment_created', 'true');
+                  
+                } catch (createError) {
+                  console.error(`❌ Failed to create environment: ${createError.message}`);
+                  core.setFailed(`Failed to create environment: ${createError.message}`);
+                  throw createError;
+                }
+              } else {
+                console.error(`❌ Unexpected error checking environment: ${error.message}`);
+                core.setFailed(`Failed to check environment: ${error.message}`);
+                throw error;
+              }
+            }
+
+  build-scan-push:
+    needs: gate-check
+    if: needs.gate-check.outputs.should_process == 'true' && needs.gate-check.outputs.has_preview_label == 'true' && needs.gate-check.outputs.is_cleanup == 'false'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.set-image-tag.outputs.image_tag }}
+      full_image_name: ${{ steps.set-image-tag.outputs.full_image_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Debug environment variables
+        run: |
+          echo "🔍 Debugging Preview Environment Variables:"
+          echo "KUBECORE_REGISTRY: '${{ env.KUBECORE_REGISTRY }}'"
+          echo "KUBECORE_KUBEPROJECT_REPO: '${{ env.KUBECORE_KUBEPROJECT_REPO }}'"
+          echo "APP_NAME: '${{ env.APP_NAME }}'"
+          echo "PR_NUMBER: '${{ env.PR_NUMBER }}'"
+          echo "SHORT_SHA: '${{ env.SHORT_SHA }}'"
+          echo "KUBECORE_REGISTRY_UNAME: [$(if [ -n '${{ env.KUBECORE_REGISTRY_UNAME }}' ]; then echo 'SET'; else echo 'EMPTY'; fi)]"
+          echo "KUBECORE_REGISTRY_PWD: [$(if [ -n '${{ env.KUBECORE_REGISTRY_PWD }}' ]; then echo 'SET'; else echo 'EMPTY'; fi)]"
+
+      - name: Set image tag
+        id: set-image-tag
+        run: |
+          # KUBECORE_REGISTRY already contains full repository path
+          # Extract registry host for docker login
+          REGISTRY_HOST=$(echo "${{ env.KUBECORE_REGISTRY }}" | cut -d'/' -f1)
+          echo "REGISTRY_HOST=${REGISTRY_HOST}" >> $GITHUB_ENV
+          IMAGE_TAG="preview-${{ env.PR_NUMBER }}-${{ env.SHORT_SHA }}"
+          FULL_IMAGE_NAME="${{ env.KUBECORE_REGISTRY }}:${IMAGE_TAG}"
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "full_image_name=${FULL_IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "Image tag: ${IMAGE_TAG}"
+          echo "Full image name: ${FULL_IMAGE_NAME}"
+
+      - name: Login to private registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY_HOST }}
+          username: ${{ env.KUBECORE_REGISTRY_UNAME }}
+          password: ${{ env.KUBECORE_REGISTRY_PWD }}
+          ecr: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: app/
+          push: true
+          tags: ${{ steps.set-image-tag.outputs.full_image_name }}
+          provenance: false
+          build-args: |
+            REGISTRY_URL=${{ env.KUBECORE_REGISTRY }}
+            KUBECORE_KUBEPROJECT_REPO=${{ env.KUBECORE_KUBEPROJECT_REPO }}
+            VERSION=${{ steps.set-image-tag.outputs.image_tag }}
+
+  deploy-preview:
+    needs: [gate-check, build-scan-push, ensure-environment]
+    if: needs.gate-check.outputs.should_process == 'true' && needs.gate-check.outputs.has_preview_label == 'true' && needs.gate-check.outputs.is_cleanup == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      deployments: write
+      pull-requests: write
+    outputs:
+      deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+    steps:
+      - name: Generate GitHub App token
+        id: create_token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.KUBECORE_APP_ID }}
+          private_key: ${{ secrets.KUBECORE_APP_PKEY }}
+
+            
+      - name: Create GitHub Deployment (per-PR environment)
+        id: deployment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.create_token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,403,404,422
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.payload.pull_request.head.sha,
+              environment: '${{env.ENVIRONMENT_NAME}}', // Using per-PR environment name
+              task: 'deploy',
+              auto_merge: false,
+              required_contexts: [],
+              payload: {
+                pr_number: context.payload.pull_request.number,
+                pr_title: context.payload.pull_request.title
+              },
+              description: `Preview deployment for PR #${context.payload.pull_request.number}`
+            });
+            
+            core.setOutput('deployment_id', deployment.data.id);
+            console.log(`✅ Created deployment with ID: ${deployment.data.id} for environment: ${{env.ENVIRONMENT_NAME}}`);
+            
+      - name: Set deployment status to pending
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.create_token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,403,404,422
+          script: |
+            const previewUrl = `https://${{ env.PR_NUMBER }}-${{ env.APP_NAME }}.preview.${{ env.KUBECORE_KUBEPROJECT_DOMAIN }}`;
+            
+            // Generate ArgoCD log URL
+            const appName = `${{ env.APP_NAME }}`;
+            const prNumber = `${{ env.PR_NUMBER }}`;
+            const baseDomain = `${{ env.KUBECORE_KUBEPROJECT_DOMAIN }}`;
+            const rolloutName = `${appName}-rollout-preview-${prNumber}`;
+            const namespace = `${appName}-preview-${prNumber}`;
+            
+            // URL encode the node parameter for ArgoCD
+            const nodeParam = `argoproj.io/Rollout/${namespace}/${rolloutName}/0`;
+            const encodedNode = encodeURIComponent(nodeParam);
+            const logUrl = `https://argocd.${baseDomain}/applications/argocd/${appName}-preview-${prNumber}?resource=&node=${encodedNode}&tab=logs`;
+            
+            console.log(`🔗 Generated ArgoCD log URL: ${logUrl}`);
+            
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.deployment.outputs.deployment_id }},
+              state: 'pending',
+              environment_url: previewUrl,
+              log_url: logUrl,
+              description: 'Deployment initiated - building container image'
+            });
+
+      - name: Comment on PR - Deployment Initiated
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.create_token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,403,404,422
+          script: |
+            const previewUrl = `https://${{ env.PR_NUMBER }}-${{ env.APP_NAME }}.preview.${{ env.KUBECORE_KUBEPROJECT_DOMAIN }}`;
+            
+            // Generate ArgoCD log URL for PR comment
+            const appName = `${{ env.APP_NAME }}`;
+            const prNumber = `${{ env.PR_NUMBER }}`;
+            const baseDomain = `${{ env.KUBECORE_KUBEPROJECT_DOMAIN }}`;
+            const rolloutName = `${appName}-rollout-preview-${prNumber}`;
+            const namespace = `${appName}-preview-${prNumber}`;
+            const nodeParam = `argoproj.io/Rollout/${namespace}/${rolloutName}/0`;
+            const encodedNode = encodeURIComponent(nodeParam);
+            const logUrl = `https://argocd.${baseDomain}/applications/argocd/${appName}-preview-${prNumber}?resource=&node=${encodedNode}&tab=logs`;
+            
+            github.rest.issues.createComment({
+              issue_number: ${{ env.PR_NUMBER }},
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🚀 Preview environment deployment initiated!
+              
+              📋 **Preview Details**:
+              - **Environment**: \`${{env.ENVIRONMENT_NAME}}\` (isolated per-PR)
+              - **Image**: \`${{ needs.build-scan-push.outputs.image_tag }}\`
+              - **Expected URL**: [${previewUrl}](${previewUrl})
+              - **Deployment ID**: \`${{ steps.deployment.outputs.deployment_id }}\`
+              
+              ⏳ **Status**: Deployment created, waiting for ArgoCD...
+              
+              📊 **Monitoring & Logs**:
+              - 🔗 [**ArgoCD Rollout Logs**](${logUrl}) - Live deployment logs
+              - 📈 [**GitHub Deployments**](https://github.com/${{ github.repository }}/deployments) - Status tracking
+              
+              📊 The GitOps system will now:
+              1. Deploy your preview environment via ArgoCD
+              2. Monitor deployment health
+              3. Update deployment status automatically
+              
+              ⚠️ **Merge Gate**: This PR can only be merged to \`dev\` after the preview deployment is successful.`
+            });
+
+  cleanup-preview:
+    needs: gate-check
+    if: needs.gate-check.outputs.is_cleanup == 'true' || needs.gate-check.outputs.is_label_removal == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      deployments: write
+      pull-requests: write
+    steps:
+      - name: Generate GitHub App token
+        id: create_token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.KUBECORE_APP_ID }}
+          private_key: ${{ secrets.KUBECORE_APP_PKEY }}
+
+      - name: Find and deactivate existing deployment
+        id: cleanup
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.create_token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,403,404,422
+          script: |
+            const environmentName = '${{env.ENVIRONMENT_NAME}}';
+            console.log(`🧹 Looking for deployments in environment: ${environmentName}`);
+            
+            try {
+              // Get deployments for this environment
+              const { data: deployments } = await github.rest.repos.listDeployments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                environment: environmentName,
+                per_page: 10
+              });
+              
+              console.log(`Found ${deployments.length} deployments for environment ${environmentName}`);
+              
+              if (deployments.length === 0) {
+                console.log(`ℹ️ No deployments found for environment ${environmentName}`);
+                core.setOutput('deployment_found', 'false');
+                return;
+              }
+              
+              // Find the most recent active deployment
+              const activeDeployment = deployments.find(d => 
+                d.environment === environmentName && 
+                ['queued', 'in_progress', 'pending', 'success'].includes(d.statuses_url ? 'active' : 'unknown')
+              ) || deployments[0]; // Fallback to most recent
+              
+              console.log(`🎯 Found deployment to deactivate: ${activeDeployment.id}`);
+              core.setOutput('deployment_found', 'true');
+              core.setOutput('deployment_id', activeDeployment.id);
+              
+              // Generate ArgoCD log URL for cleanup status
+              const appName = `${{ env.APP_NAME }}`;
+              const prNumber = `${{ env.PR_NUMBER }}`;
+              const baseDomain = `${{ env.KUBECORE_KUBEPROJECT_DOMAIN }}`;
+              const rolloutName = `${appName}-rollout-preview-${prNumber}`;
+              const namespace = `${appName}-preview-${prNumber}`;
+              const nodeParam = `argoproj.io/Rollout/${namespace}/${rolloutName}/0`;
+              const encodedNode = encodeURIComponent(nodeParam);
+              const logUrl = `https://argocd.${baseDomain}/applications/argocd/${appName}-preview-${prNumber}?resource=&node=${encodedNode}&tab=logs`;
+              
+              // Set deployment status to inactive - this triggers Argo cleanup
+              await github.rest.repos.createDeploymentStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                deployment_id: activeDeployment.id,
+                state: 'inactive',
+                log_url: logUrl,
+                description: `Preview environment cleanup triggered - ${context.payload.action === 'closed' ? 'PR closed' : 'preview label removed'}`
+              });
+              
+              console.log(`✅ Deployment ${activeDeployment.id} marked as inactive with log URL: ${logUrl}`);
+              
+            } catch (error) {
+              console.error(`❌ Error during cleanup: ${error.message}`);
+              core.setFailed(`Failed to cleanup deployment: ${error.message}`);
+              throw error;
+            }
+
+      - name: Comment on PR - Cleanup Initiated
+        if: steps.cleanup.outputs.deployment_found == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.create_token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,403,404,422
+          script: |
+            const cleanupReason = context.payload.action === 'closed' ? 'PR was closed/merged' : 'Preview label was removed';
+            
+            // Generate ArgoCD log URL for PR comment
+            const appName = `${{ env.APP_NAME }}`;
+            const prNumber = `${{ env.PR_NUMBER }}`;
+            const baseDomain = `${{ env.KUBECORE_KUBEPROJECT_DOMAIN }}`;
+            const rolloutName = `${appName}-rollout-preview-${prNumber}`;
+            const namespace = `${appName}-preview-${prNumber}`;
+            const nodeParam = `argoproj.io/Rollout/${namespace}/${rolloutName}/0`;
+            const encodedNode = encodeURIComponent(nodeParam);
+            const logUrl = `https://argocd.${baseDomain}/applications/argocd/${appName}-preview-${prNumber}?resource=&node=${encodedNode}&tab=logs`;
+            
+            github.rest.issues.createComment({
+              issue_number: ${{ env.PR_NUMBER }},
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🧹 Preview environment cleanup initiated!
+              
+              📋 **Cleanup Details**:
+              - **Reason**: ${cleanupReason}
+              - **Environment**: \`${{env.ENVIRONMENT_NAME}}\`
+              - **Deployment ID**: \`${{ steps.cleanup.outputs.deployment_id }}\`
+              
+              ⏳ **Status**: Deployment marked as inactive, ArgoCD will clean up resources...
+              
+              📊 **Final Logs & Monitoring**:
+              - 🔗 [**ArgoCD Rollout Logs**](${logUrl}) - Final deployment logs
+              - 📈 [**GitHub Deployments**](https://github.com/${{ github.repository }}/deployments) - Status history
+              
+              📊 The GitOps system will now:
+              1. Receive deployment status change event
+              2. Delete Kubernetes resources for this PR
+              3. Clean up the preview environment`
+            });
+            
+  # Enhanced job for merge-backs - logs and sets bypass status
+  log-merge-back-skip:
+    needs: gate-check
+    if: needs.gate-check.outputs.is_merge_back == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+      pull-requests: write
+    steps:
+      - name: Generate GitHub App token
+        id: create_token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.KUBECORE_APP_ID }}
+          private_key: ${{ secrets.KUBECORE_APP_PKEY }}
+
+      - name: Set preview-deployment-validation status to success for merge-back
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.create_token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,403,404,422
+          script: |
+            const sourceBranch = '${{ github.event.pull_request.head.ref }}';
+            
+            console.log(`🔄 Setting bypass status for merge-back from ${sourceBranch}`);
+            
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: 'success',
+              target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: `Bypassed for merge-back from ${sourceBranch}`,
+              context: 'preview-deployment-validation'
+            });
+            
+            console.log(`✅ Successfully set preview-deployment-validation status to success`);
+
+      - name: Comment on PR - Merge-back Status
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.create_token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,403,404,422
+          script: |
+            const sourceBranch = '${{ github.event.pull_request.head.ref }}';
+            
+            github.rest.issues.createComment({
+              issue_number: ${{ github.event.pull_request.number }},
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🔄 **Merge-back Detected**
+              
+              📋 **Details**:
+              - **Source Branch**: \`${sourceBranch}\`
+              - **Target Branch**: \`dev\`
+              - **Preview Environment**: Not required for merge-backs
+              
+              ✅ **Status**: Preview deployment validation automatically bypassed for merge-backs.
+              
+              ℹ️ Merge-backs from \`main\` and \`rc/\` branches don't need preview environments since they contain already-tested code.`
+            });
+
+      - name: Log merge-back skip
+        run: |
+          echo "::notice title=Preview Bypassed for Merge-back::Preview environments are not created for merge-backs from ${{ github.event.pull_request.head.ref }}"
+          echo "✅ Status check 'preview-deployment-validation' set to SUCCESS (bypassed)"
+          echo "This is expected behavior. Merge-backs from main or rc branches don't need preview environments."
+
+  # Fast job for missing preview label - create failing status check
+  log-no-preview-label:
+    needs: gate-check
+    if: needs.gate-check.outputs.should_process == 'false' && needs.gate-check.outputs.is_merge_back == 'false' && needs.gate-check.outputs.is_cleanup == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - name: Generate GitHub App token
+        id: create_token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.KUBECORE_APP_ID }}
+          private_key: ${{ secrets.KUBECORE_APP_PKEY }}
+
+      - name: Comment about missing preview label
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.create_token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,403,404,422
+          script: |
+            github.rest.issues.createComment({
+              issue_number: ${{ github.event.pull_request.number }},
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `ℹ️ **Preview Environment Not Requested**
+              
+              To create a preview environment for this PR, add the \`preview\` label.
+              
+              ⚠️ **Branch Protection**: The \`dev\` branch requires a successful preview deployment validation.
+              Without the \`preview\` label, this PR cannot be merged.
+              
+              📋 Preview environments allow you to test changes before merging to dev.`
+            });

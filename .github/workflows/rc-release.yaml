@@ -1,0 +1,612 @@
+name: 🍬 RC release, deploy to stage 🍬 
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+    branches:
+      - main
+    
+  # Allow manual triggering for specific RC branches
+  # workflow_dispatch:
+  #   inputs:
+  #     rc_bump:
+  #       description: 'Force RC version bump'
+  #       required: false
+  #       default: false
+  #       type: boolean
+
+env:
+  KUBECORE_REGISTRY: ${{ vars.KUBECORE_REGISTRY }}
+  KUBECORE_REGISTRY_UNAME: ${{ secrets.KUBECORE_REGISTRY_UNAME }}
+  KUBECORE_REGISTRY_PWD: ${{ secrets.KUBECORE_REGISTRY_PWD }}
+  KUBECORE_KUBEPROJECT_REPO: ${{ vars.KUBECORE_KUBEPROJECT_REPO }}
+  APP_NAME: ${{ github.event.repository.name }}
+  SHORT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  ENVIRONMENT_NAME: 'staging'
+
+jobs:
+  # Add a gate check to ensure this is an RC branch PR
+  validate-rc-pr:
+    runs-on: ubuntu-latest
+    outputs:
+      is_rc_branch: ${{ steps.check-branch.outputs.is_rc_branch }}
+      branch_name: ${{ steps.check-branch.outputs.branch_name }}
+    steps:
+      - name: Check if PR is from RC branch
+        id: check-branch
+        run: |
+          # For PR events
+          if [[ "${{ github.event_name }}" == "pull_request" || "${{ github.event_name }}" == "pull_request_target" ]]; then
+            BRANCH_NAME="${{ github.event.pull_request.head.ref }}"
+          else
+            BRANCH_NAME="${{ github.ref_name }}"
+          fi
+          
+          echo "Branch name: $BRANCH_NAME"
+          
+          if [[ $BRANCH_NAME =~ ^rc/v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "is_rc_branch=true" >> $GITHUB_OUTPUT
+            echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+            echo "✅ Valid RC branch: $BRANCH_NAME"
+          else
+            echo "is_rc_branch=false" >> $GITHUB_OUTPUT
+            echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+            echo "❌ Not an RC branch: $BRANCH_NAME"
+          fi
+
+  prepare-rc:
+    needs: validate-rc-pr
+    if: needs.validate-rc-pr.outputs.is_rc_branch == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      semantic_version: ${{ steps.extract-version.outputs.semantic_version }}
+      rc_version: ${{ steps.calculate-rc-version.outputs.rc_version }}
+      rc_tag: ${{ steps.calculate-rc-version.outputs.rc_tag }}
+      full_image_name: ${{ steps.set-image-tag.outputs.full_image_name }}
+      image_tag: ${{ steps.set-image-tag.outputs.image_tag }}
+      pr_number: ${{ steps.create-pr.outputs.pr_number }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: '0'  # Full history for tag detection
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Extract semantic version from branch name
+        id: extract-version
+        run: |
+          # For PR events
+          if [[ "${{ github.event_name }}" == "pull_request" || "${{ github.event_name }}" == "pull_request_target" ]]; then
+            BRANCH_NAME="${{ github.event.pull_request.head.ref }}"
+          else
+            BRANCH_NAME="${{ github.ref_name }}"
+          fi
+          
+          # Extract version from branch name (rc/vX.Y.Z → X.Y.Z)
+          SEMANTIC_VERSION=$(echo "$BRANCH_NAME" | sed -E 's/rc\/v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+          
+          echo "Branch name: $BRANCH_NAME"
+          echo "Extracted semantic version: $SEMANTIC_VERSION"
+          echo "semantic_version=$SEMANTIC_VERSION" >> $GITHUB_OUTPUT
+      
+      - name: Calculate RC version
+        id: calculate-rc-version
+        run: |
+          # Get the semantic version from the branch name
+          SEMANTIC_VERSION="${{ steps.extract-version.outputs.semantic_version }}"
+          
+          # Fetch all tags
+          git fetch --tags --force
+          
+          # Get all RC tags for this specific semantic version and sort them
+          RC_TAGS=$(git tag -l "v${SEMANTIC_VERSION}-rc*" | sort -V)
+          echo "All RC tags for version ${SEMANTIC_VERSION}: $RC_TAGS"
+          
+          if [ -z "$RC_TAGS" ]; then
+            # No RC tags exist yet for this semantic version
+            RC_NUMBER=1
+            echo "No existing RC tags found for v${SEMANTIC_VERSION}, starting with rc1"
+          else
+            # Get the latest RC tag
+            LATEST_RC_TAG=$(echo "$RC_TAGS" | tail -n 1)
+            echo "Latest RC tag: $LATEST_RC_TAG"
+            
+            # Extract RC number from tag
+            CURRENT_RC_NUMBER=$(echo "$LATEST_RC_TAG" | sed -E 's/v[0-9]+\.[0-9]+\.[0-9]+-rc([0-9]+)/\1/')
+            echo "Current RC number: $CURRENT_RC_NUMBER"
+            
+            # Always increment for each new push to RC branch
+            RC_NUMBER=$((CURRENT_RC_NUMBER + 1))
+            echo "Incrementing RC number: rc$CURRENT_RC_NUMBER → rc$RC_NUMBER"
+          fi
+          
+          # Format the RC version tag
+          RC_TAG="v${SEMANTIC_VERSION}-rc${RC_NUMBER}"
+          RC_VERSION="${SEMANTIC_VERSION}-rc${RC_NUMBER}"
+          
+          echo "rc_version=$RC_VERSION" >> $GITHUB_OUTPUT
+          echo "rc_tag=$RC_TAG" >> $GITHUB_OUTPUT
+          echo "RC version: $RC_VERSION"
+          echo "RC tag: $RC_TAG"
+      
+      - name: Set image tag
+        id: set-image-tag
+        run: |
+          # KUBECORE_REGISTRY already contains full repository path
+          # Extract registry host for docker login
+          REGISTRY_HOST=$(echo "${{ env.KUBECORE_REGISTRY }}" | cut -d'/' -f1)
+          echo "REGISTRY_HOST=${REGISTRY_HOST}" >> $GITHUB_ENV
+
+          RC_TAG="${{ steps.calculate-rc-version.outputs.rc_tag }}"
+
+          # Use KUBECORE_REGISTRY directly for image name
+          FULL_IMAGE_NAME="${{ env.KUBECORE_REGISTRY }}:${RC_TAG}"
+
+          # Set output with proper GitHub Actions syntax
+          echo "image_tag=${RC_TAG}" >> $GITHUB_OUTPUT
+          echo "full_image_name=${FULL_IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "Image tag: ${RC_TAG}"
+          echo "Full image name: ${FULL_IMAGE_NAME}"
+
+      - name: Generate GitHub App token
+        id: create_token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.KUBECORE_APP_ID }}
+          private_key: ${{ secrets.KUBECORE_APP_PKEY }}
+
+      - name: Create or Update PR to main
+        id: create-pr
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.create_token.outputs.token }}
+          script: |
+            const sourceBranch = '${{ needs.validate-rc-pr.outputs.branch_name }}';
+            const rcTag = '${{ steps.calculate-rc-version.outputs.rc_tag }}';
+            const semanticVersion = '${{ steps.extract-version.outputs.semantic_version }}';
+            
+            // Search for existing PR from this RC branch to main
+            const { data: existingPRs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${sourceBranch}`,
+              base: 'main',
+              state: 'open'
+            });
+            
+            let pr;
+            if (existingPRs.length === 0) {
+              // Create new PR
+              const { data: newPR } = await github.rest.pulls.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `🚀 Release ${rcTag} to Production`,
+                body: `## Release Candidate ${rcTag}
+
+                This PR represents the promotion of version ${semanticVersion} to production.
+
+                ### Deployment Gates:
+                - [ ] Staging deployment successful
+                - [ ] QA approval
+                - [ ] Product approval
+
+                ### Changes included:
+                - Release candidate version: ${rcTag}
+                - Base version: ${semanticVersion}
+                - Source branch: ${sourceBranch}
+
+                ### Deployment Status:
+                The staging deployment status will be tracked here. Merging to main will be blocked until staging deployment is successful.
+                
+                ### Release Tracking
+                This PR will close the associated release tracking issue when merged.`,
+                head: sourceBranch,
+                base: 'main'
+              });
+              pr = newPR;
+              console.log(`Created new PR #${pr.number}`);
+            } else {
+              pr = existingPRs[0];
+              console.log(`Found existing PR #${pr.number}`);
+            }
+            
+            core.setOutput('pr_number', pr.number.toString());
+            
+            // Store PR URL for later use
+            core.setOutput('pr_url', pr.html_url);
+
+      # Debugging step to verify job outputs
+      - name: Debug outputs
+        run: |
+          echo "Verifying step outputs:"
+          echo "semantic_version: ${{ steps.extract-version.outputs.semantic_version }}"
+          echo "rc_version: ${{ steps.calculate-rc-version.outputs.rc_version }}"
+          echo "rc_tag: ${{ steps.calculate-rc-version.outputs.rc_tag }}"
+          echo "full_image_name: ${{ steps.set-image-tag.outputs.full_image_name }}"
+          echo "pr_number: ${{ steps.create-pr.outputs.pr_number }}"
+          echo "pr_url: ${{ steps.create-pr.outputs.pr_url }}"
+
+  build-rc-image:
+    needs: prepare-rc
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set build variables
+        run: |
+          # KUBECORE_REGISTRY already contains full repository path
+          # Extract registry host for docker login
+          REGISTRY_HOST=$(echo "${{ env.KUBECORE_REGISTRY }}" | cut -d'/' -f1)
+          echo "REGISTRY_HOST=${REGISTRY_HOST}" >> $GITHUB_ENV
+
+          echo "REGISTRY_URL=${{ env.KUBECORE_REGISTRY }}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${{ needs.prepare-rc.outputs.rc_tag }}" >> $GITHUB_ENV
+          echo "FULL_IMAGE_NAME=${{ env.KUBECORE_REGISTRY }}:${{ needs.prepare-rc.outputs.rc_tag }}" >> $GITHUB_ENV
+
+      - name: Login to private registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY_HOST }}
+          username: ${{ env.KUBECORE_REGISTRY_UNAME }}
+          password: ${{ env.KUBECORE_REGISTRY_PWD }}
+          ecr: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6.17.0
+        with:
+          context: ./app
+          file: ./app/Dockerfile
+          push: true
+          tags: ${{ env.FULL_IMAGE_NAME }}
+          provenance: false
+          build-args: |
+            REGISTRY_URL=${{ env.KUBECORE_REGISTRY }}
+            KUBECORE_KUBEPROJECT_REPO=${{ env.KUBECORE_KUBEPROJECT_REPO }}
+            VERSION=${{ needs.prepare-rc.outputs.rc_tag }}
+
+  create-deployment:
+    needs: [prepare-rc, build-rc-image]
+    runs-on: ubuntu-latest
+    environment: staging
+    outputs:
+      deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+    steps:
+      - name: Generate GitHub App token
+        id: create_token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.KUBECORE_APP_ID }}
+          private_key: ${{ secrets.KUBECORE_APP_PKEY }}
+
+      - name: Create GitHub Deployment
+        id: deployment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.create_token.outputs.token }}
+          script: |
+            const { data: deployment } = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: 'staging',
+              auto_merge: false,
+              required_contexts: [],
+              description: 'Deploying RC to staging',
+              // Explicitly set production to false for staging
+              production_environment: false,
+              // Add transient_environment for staging
+              transient_environment: true
+            });
+            
+            core.setOutput('deployment_id', deployment.id.toString());
+            console.log(`Created deployment ${deployment.id} for staging environment`);
+            
+            // Note: We do not set an initial status here.
+            // The GitOps system will update the deployment status as it progresses.
+
+  create-prerelease:
+    needs: [prepare-rc, build-rc-image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_url: ${{ steps.create-release.outputs.release_url }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate GitHub App token
+        id: create_token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.KUBECORE_APP_ID }}
+          private_key: ${{ secrets.KUBECORE_APP_PKEY }}
+
+      - name: Generate Release Notes
+        id: release-notes
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.create_token.outputs.token }}
+          script: |
+            try {
+              const { data: notes } = await github.rest.repos.generateReleaseNotes({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: '${{ needs.prepare-rc.outputs.rc_tag }}',
+                target_commitish: '${{ needs.validate-rc-pr.outputs.branch_name }}',
+                previous_tag_name: null  // Auto-detect previous tag
+              });
+              
+              core.setOutput('notes', notes.body);
+            } catch (error) {
+              console.error('Error generating release notes:', error);
+              core.setOutput('notes', '### Changes in this Release Candidate\n\nNo automated release notes available.');
+            }
+
+      - name: Create Pre-release
+        id: create-release
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.create_token.outputs.token }}
+          script: |
+            try {
+              const { data: release } = await github.rest.repos.createRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: '${{ needs.prepare-rc.outputs.rc_tag }}',
+                name: 'Release Candidate ${{ needs.prepare-rc.outputs.rc_tag }}',
+                body: `${{ steps.release-notes.outputs.notes }}
+
+                ### Deployment Status
+                This is a pre-release version currently being deployed to staging.
+                
+                ### Validation Status
+                - [ ] Staging deployment successful
+                - [ ] QA validation complete
+                - [ ] Ready for production
+                
+                ### Next Steps
+                1. Monitor staging deployment
+                2. Complete QA validation
+                3. If approved, merge the associated PR to promote to production`,
+                prerelease: true,
+                draft: false,
+                target_commitish: '${{ needs.validate-rc-pr.outputs.branch_name }}'
+              });
+              
+              console.log(`Created pre-release: ${release.html_url}`);
+              core.setOutput('release_url', release.html_url);
+            } catch (error) {
+              console.error('Error creating pre-release:', error);
+              core.setFailed('Failed to create pre-release');
+            }
+
+  notify-team:
+    needs: [prepare-rc, build-rc-image, create-prerelease]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - name: Generate GitHub App token
+        id: create_token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.KUBECORE_APP_ID }}
+          private_key: ${{ secrets.KUBECORE_APP_PKEY }}
+
+      - name: Find or Update RC Issue
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.create_token.outputs.token }}
+          script: |
+            const rcTag = '${{ needs.prepare-rc.outputs.rc_tag }}';
+            const semanticVersion = '${{ needs.prepare-rc.outputs.semantic_version }}';
+            const baseVersion = semanticVersion.match(/(\d+\.\d+\.\d+)/)[1];
+            const prNumber = '${{ needs.prepare-rc.outputs.pr_number }}';
+            const deploymentId = '${{ needs.create-deployment.outputs.deployment_id }}';
+            
+            // Search for existing issues with this RC version base (e.g., 2.18.0)
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: ['release-candidate'],
+              per_page: 100
+            });
+            
+            // Find issue for this semantic version (ignoring rc number)
+            const rcIssue = issues.find(issue => {
+              // Match either v2.18.0-rc1, v2.18.0-rc2, etc.
+              const versionPattern = new RegExp(`v${baseVersion}-rc\\d+`);
+              return issue.title.includes(`Release Candidate v${baseVersion}`) || 
+                     versionPattern.test(issue.title);
+            });
+
+            // Get deployment status
+            let deploymentStatus = 'pending';
+            let deploymentStatusDescription = 'Deployment in progress';
+            if (deploymentId) {
+              try {
+                const { data: deployment } = await github.rest.repos.getDeployment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  deployment_id: parseInt(deploymentId)
+                });
+                const { data: statuses } = await github.rest.repos.listDeploymentStatuses({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  deployment_id: parseInt(deploymentId)
+                });
+                if (statuses.length > 0) {
+                  deploymentStatus = statuses[0].state;
+                  deploymentStatusDescription = statuses[0].description;
+                }
+              } catch (error) {
+                console.error('Error fetching deployment status:', error);
+              }
+            }
+
+            // Get PR details
+            let prDetails = '';
+            if (prNumber) {
+              try {
+                const { data: pr } = await github.rest.pulls.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: parseInt(prNumber)
+                });
+                prDetails = `
+                ### Production Release PR
+                - **PR**: [#${pr.number} - ${pr.title}](${pr.html_url})
+                - **Status**: ${pr.mergeable_state}
+                - **Checks**: ${pr.mergeable ? '✅ Ready to merge' : '⏳ Checks pending'}
+                `;
+              } catch (error) {
+                console.error('Error fetching PR details:', error);
+              }
+            }
+
+            // Get pre-release details
+            let releaseDetails = '';
+            try {
+              const { data: release } = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: rcTag
+              });
+              releaseDetails = `
+              ### Pre-release Information
+              - **Release**: [${release.name}](${release.html_url})
+              - **Assets**: ${release.assets.length} files
+              - **Created**: ${new Date(release.created_at).toLocaleString()}
+              `;
+            } catch (error) {
+              console.error('Error fetching release details:', error);
+            }
+            
+            const message = `## 🚀 Release Candidate Update
+            
+            ### Release Information
+            - **RC Version**: \`${rcTag}\`
+            - **Base Version**: \`v${baseVersion}\`
+            - **RC Image**: \`${{ needs.prepare-rc.outputs.full_image_name }}\`
+            - **Branch**: \`${{ github.ref_name }}\`
+            
+            ${releaseDetails}
+            
+            ${prDetails}
+            
+            ### Deployment Status
+            - **Environment**: \`staging\`
+            - **Status**: ${deploymentStatus === 'success' ? '✅' : deploymentStatus === 'failure' ? '❌' : '⏳'} ${deploymentStatus}
+            - **Details**: ${deploymentStatusDescription}
+            - **Deployment URL**: ${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/deployments/${deploymentId}
+            
+            ### Release Process Checklist
+            - [ ] Staging deployment successful
+            - [ ] QA validation completed
+            - [ ] Performance tests passed
+            - [ ] Documentation updated
+            - [ ] Release notes reviewed
+            - [ ] Security scan completed
+            - [ ] Product team approval
+            - [ ] Ready for production release
+            
+            ### Quick Links
+            - [Pre-release](${{ needs.create-prerelease.outputs.release_url }})
+            - [Deployment Status](${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/deployments)
+            - [CI/CD Pipeline](${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+            
+            ### Previous Versions
+            ${rcIssue ? '_(This is an update to an existing RC)_' : '_(This is a new RC)_'}
+            
+            > This issue will be automatically closed when PR #${prNumber} is merged to main.`;
+            
+            if (rcIssue) {
+              // Update existing issue title to reflect new RC version
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: rcIssue.number,
+                title: `Release Candidate ${rcTag} Status Tracking`
+              });
+              
+              // Add comment with update
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: rcIssue.number,
+                body: message
+              });
+              
+              console.log(`Updated existing RC issue #${rcIssue.number} for ${rcTag}`);
+            } else {
+              // Create new issue and link it to the PR
+              const { data: newIssue } = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `Release Candidate ${rcTag} Status Tracking`,
+                body: message,
+                labels: ['release-candidate', 'staging-deployment']
+              });
+              
+              // Link the PR to close this issue when merged
+              if (prNumber) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: parseInt(prNumber),
+                  body: `Closes #${newIssue.number}`
+                });
+              }
+              
+              console.log(`Created new RC issue #${newIssue.number} for ${rcTag}`);
+            }
+
+  notify-gitops-repository:
+    needs: [prepare-rc, build-rc-image, create-deployment, create-prerelease]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate token
+        id: create_token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.KUBECORE_APP_ID }}
+          private_key: ${{ secrets.KUBECORE_APP_PKEY }}
+
+      - name: Dispatch Staging Environment Update Event
+        uses: peter-evans/repository-dispatch@v2
+        with:
+          token: ${{ steps.create_token.outputs.token }}
+          event-type: staging-environment-update
+          repository: ${{ github.repository_owner }}/${{ env.KUBECORE_KUBEPROJECT_REPO }}
+          client-payload: >-
+            {
+              "version": "${{ needs.prepare-rc.outputs.rc_tag }}",
+              "image": "${{ needs.prepare-rc.outputs.full_image_name }}",
+              "app_name": "${{ env.APP_NAME }}",
+              "semantic_version": "v${{ needs.prepare-rc.outputs.semantic_version }}",
+              "rc_version": "${{ needs.prepare-rc.outputs.rc_version }}",
+              "commit_sha": "${{ github.sha }}",
+              "branch": "${{ github.ref_name }}",
+              "plain_image_name": "${{ env.KUBECORE_REGISTRY }}",
+              "deployment_id": "${{ needs.create-deployment.outputs.deployment_id }}",
+              "pr_number": "${{ needs.prepare-rc.outputs.pr_number }}"
+            }
+  
