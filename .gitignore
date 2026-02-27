@@ -1,6 +1,7 @@
 # Go binaries
 app/bin/
 app/server
+app/api
 app/coverage.out
 app/coverage.html
 
